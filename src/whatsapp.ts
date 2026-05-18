@@ -153,32 +153,42 @@ class WhatsAppService {
 
   async listGroups() {
     await this.ensureConnected();
-    const groups = await this.socket!.groupFetchAllParticipating();
-    return Object.values(groups)
-      .map((group) => ({
-        jid: group.id,
-        name: group.subject || group.id,
-        participants: group.participants?.length ?? 0
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    try {
+      const groups = await this.socket!.groupFetchAllParticipating();
+      return Object.values(groups)
+        .map((group) => ({
+          jid: group.id,
+          name: group.subject || group.id,
+          participants: group.participants?.length ?? 0
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch (error) {
+      this.handleSocketError(error);
+    }
   }
 
   async resolveNumber(phone: string) {
     await this.ensureConnected();
     const digits = phone.replace(/\D/g, '');
-    if (!digits) throw new Error('Telefone invalido');
-    const matches = await this.socket!.onWhatsApp(digits);
-    const match = matches?.find((item) => item.exists);
-    if (!match?.jid) {
-      throw new Error(`Numero nao encontrado no WhatsApp: ${digits}`);
+    if (!digits) throw new Error('Telefone inválido');
+    try {
+      const matches = await this.socket!.onWhatsApp(digits);
+      const match = matches?.find((item) => item.exists);
+      if (!match?.jid) throw new Error(`Número não encontrado no WhatsApp: ${digits}`);
+      return jidNormalizedUser(match.jid);
+    } catch (error) {
+      this.handleSocketError(error);
     }
-    return jidNormalizedUser(match.jid);
   }
 
   async send(payload: SendPayload) {
     await this.ensureConnected();
-    const content = await this.buildMessage(payload);
-    return this.socket!.sendMessage(payload.jid, content);
+    try {
+      const content = await this.buildMessage(payload);
+      return await this.socket!.sendMessage(payload.jid, content);
+    } catch (error) {
+      this.handleSocketError(error);
+    }
   }
 
   private async ensureConnected() {
@@ -186,8 +196,19 @@ class WhatsAppService {
       await this.connect();
     }
     if (!this.socket || !this.status.connected) {
-      throw new Error('WhatsApp ainda nao esta conectado');
+      throw new Error('WhatsApp não está conectado. Escaneie o QR code primeiro.');
     }
+  }
+
+  private handleSocketError(error: unknown): never {
+    const msg = error instanceof Error ? error.message : String(error);
+    const isConnErr = /connection closed|connection lost|timed out|socket closed/i.test(msg);
+    if (isConnErr) {
+      this.setStatus({ connected: false, connecting: false, lastDisconnect: msg });
+      this.socket = undefined;
+      throw new Error('WhatsApp desconectou durante a operação. Reconecte e tente novamente.');
+    }
+    throw error;
   }
 
   private async buildMessage(payload: SendPayload): Promise<AnyMessageContent> {

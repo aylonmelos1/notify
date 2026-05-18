@@ -23,8 +23,9 @@ type Job = {
   destination_name: string | null;
   destination_jid: string;
   message_text: string;
-  status: string;
+  status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
   error: string | null;
+  attempts: number;
   created_at: string;
   sent_at: string | null;
 };
@@ -127,9 +128,14 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
   async function run(action: () => Promise<unknown>, message: string) {
     setNotice('');
-    await action();
-    await refresh();
-    setNotice(message);
+    try {
+      await action();
+      await refresh();
+      setNotice(message);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setNotice(`erro:${msg}`);
+    }
   }
 
   const meta = sectionMeta[section];
@@ -176,13 +182,22 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </span>
         </header>
 
-        {notice && <div className="notice">{notice}</div>}
+        {notice && (
+          notice.startsWith('erro:')
+            ? <div className="error">{notice.slice(5)}</div>
+            : <div className="notice">{notice}</div>
+        )}
 
         {section === 'conexao'   && <ConnectionCard status={status} api={api} run={run} />}
         {section === 'destinos'  && <DestinationCard destinations={destinations} api={api} run={run} />}
         {section === 'templates' && <TemplateCard templates={templates} api={api} run={run} />}
         {section === 'envio'     && <SendCard destinations={destinations} templates={templates} api={api} run={run} />}
-        {section === 'historico' && <JobsCard jobs={jobs} />}
+        {section === 'historico' && (
+          <JobsCard
+            jobs={jobs}
+            onRetry={(id) => run(() => api.post(`/api/admin/jobs/${id}/retry`, {}), 'Job reenfileirado')}
+          />
+        )}
         {section === 'api'       && <ApiSection apiInfo={apiInfo} />}
       </div>
     </main>
@@ -443,25 +458,109 @@ function SendCard({ destinations, templates, api, run }: {
 
 /* ── Jobs ───────────────────────────────────────── */
 
-function JobsCard({ jobs }: { jobs: Job[] }) {
+const STATUS_LABEL: Record<Job['status'], string> = {
+  pending:   'Pendente',
+  sent:      'Enviado',
+  delivered: 'Entregue',
+  read:      'Lido',
+  failed:    'Falhou',
+};
+
+function friendlyError(raw: string): string {
+  if (/fetch failed|network/i.test(raw))            return 'Falha de rede ao enviar';
+  if (/connection closed|connection lost/i.test(raw)) return 'Conexão com WhatsApp perdida';
+  if (/não está conectado|not connected/i.test(raw))  return 'WhatsApp desconectado';
+  if (/timed? out/i.test(raw))                        return 'Tempo limite esgotado';
+  if (/número não encontrado/i.test(raw))             return 'Número não encontrado no WhatsApp';
+  if (/variavel|variable/i.test(raw))                 return 'Variável ausente no template';
+  if (raw.length > 72)                                return raw.slice(0, 72) + '…';
+  return raw;
+}
+
+function fmtDate(s: string) {
+  const [date, time] = s.split(' ');
+  const [, month, day] = date.split('-');
+  const [h, m] = time.split(':');
+  return `${day}/${month} ${h}:${m}`;
+}
+
+function JobsCard({ jobs, onRetry }: { jobs: Job[]; onRetry: (id: string) => void }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+
   return (
     <section className="panel" id="historico">
       <div className="section-title">
         <div>
           <h3>Fila de envios</h3>
-          <p>Atualizado automaticamente a cada 5 segundos.</p>
+          <p>Atualizado a cada 5 segundos.</p>
         </div>
       </div>
-      <DataTable
-        columns={['Data', 'Destino', 'Mensagem', 'Status', 'Erro']}
-        rows={jobs.map((j) => [
-          j.created_at,
-          j.destination_name || j.destination_jid,
-          j.message_text,
-          j.status,
-          j.error || '—',
-        ])}
-      />
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Data</th>
+              <th>Destino</th>
+              <th>Mensagem</th>
+              <th>Status</th>
+              <th>Erro</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {jobs.length === 0 && (
+              <tr><td colSpan={6} style={{ color: 'var(--muted)', textAlign: 'center' }}>Nenhum registro.</td></tr>
+            )}
+            {jobs.map((job) => (
+              <React.Fragment key={job.id}>
+                <tr>
+                  <td style={{ whiteSpace: 'nowrap', color: 'var(--muted)' }}>{fmtDate(job.created_at)}</td>
+                  <td>{job.destination_name || job.destination_jid}</td>
+                  <td className="cell-message">{job.message_text}</td>
+                  <td>
+                    <span className={`job-status job-status--${job.status}`}>
+                      {STATUS_LABEL[job.status]}
+                    </span>
+                    {job.attempts > 1 && (
+                      <span className="job-attempts">{job.attempts}×</span>
+                    )}
+                  </td>
+                  <td>
+                    {job.error ? (
+                      <button
+                        className="error-cell"
+                        onClick={() => setExpanded(expanded === job.id ? null : job.id)}
+                        title="Clique para ver o erro completo"
+                      >
+                        {friendlyError(job.error)}
+                        <span className="error-chevron">{expanded === job.id ? '▲' : '▼'}</span>
+                      </button>
+                    ) : <span style={{ color: 'var(--muted)' }}>—</span>}
+                  </td>
+                  <td>
+                    {job.status === 'failed' && (
+                      <button
+                        className="retry-btn"
+                        onClick={() => onRetry(job.id)}
+                        title="Reenviar esta mensagem"
+                      >
+                        Retentar
+                      </button>
+                    )}
+                  </td>
+                </tr>
+                {expanded === job.id && job.error && (
+                  <tr className="error-detail-row">
+                    <td colSpan={6}>
+                      <code className="error-raw">{job.error}</code>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

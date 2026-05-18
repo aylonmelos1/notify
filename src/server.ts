@@ -70,6 +70,16 @@ function requireApi(request: FastifyRequest, reply: FastifyReply, done: (err?: E
   done();
 }
 
+function isWhatsAppError(error: unknown) {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /não está conectado|desconectou|connection closed|connection lost/i.test(msg);
+}
+
+function waError(reply: FastifyReply, error: unknown) {
+  const msg = error instanceof Error ? error.message : String(error);
+  return reply.code(503).send({ error: msg });
+}
+
 function parseId(request: FastifyRequest) {
   const id = Number((request.params as { id: string }).id);
   if (!Number.isInteger(id) || id < 1) throw new Error('ID invalido');
@@ -124,13 +134,19 @@ app.post('/api/admin/whatsapp/logout', { preHandler: requireAdmin }, async () =>
   return whatsapp.getStatus();
 });
 
-app.get('/api/admin/groups/available', { preHandler: requireAdmin }, async () => whatsapp.listGroups());
-app.get('/api/admin/whatsapp/check-number', { preHandler: requireAdmin }, async (request) => {
-  const phone = String((request.query as { phone?: string }).phone ?? '');
-  return { phone: phone.replace(/\D/g, ''), jid: await whatsapp.resolveNumber(phone) };
+app.get('/api/admin/groups/available', { preHandler: requireAdmin }, async (request, reply) => {
+  try { return await whatsapp.listGroups(); }
+  catch (error) { return waError(reply, error); }
 });
-app.post('/api/admin/groups/sync', { preHandler: requireAdmin }, async () => {
-  const groups = await whatsapp.listGroups();
+app.get('/api/admin/whatsapp/check-number', { preHandler: requireAdmin }, async (request, reply) => {
+  const phone = String((request.query as { phone?: string }).phone ?? '');
+  try { return { phone: phone.replace(/\D/g, ''), jid: await whatsapp.resolveNumber(phone) }; }
+  catch (error) { return waError(reply, error); }
+});
+app.post('/api/admin/groups/sync', { preHandler: requireAdmin }, async (request, reply) => {
+  let groups: Awaited<ReturnType<typeof whatsapp.listGroups>>;
+  try { groups = await whatsapp.listGroups(); }
+  catch (error) { return waError(reply, error); }
   const upsert = db.prepare(`
     insert into destinations (name, type, phone, jid, enabled, updated_at)
     values (@name, 'group', null, @jid, 1, datetime('now'))
@@ -200,6 +216,20 @@ app.delete('/api/admin/templates/:id', { preHandler: requireAdmin }, async (requ
 app.get('/api/admin/jobs', { preHandler: requireAdmin }, async (request) => {
   const limit = Number((request.query as { limit?: string }).limit ?? 100);
   return listJobs(Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 300) : 100);
+});
+
+app.post('/api/admin/jobs/:id/retry', { preHandler: requireAdmin }, async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const job = db.prepare<[string], { status: string; payload_json: string }>(
+    'select status, payload_json from message_jobs where id = ?'
+  ).get(id);
+  if (!job) return reply.code(404).send({ error: 'Job não encontrado' });
+  if (job.status !== 'failed') return reply.code(400).send({ error: 'Apenas jobs com status "failed" podem ser reenfileirados' });
+  try {
+    return await enqueueMessage(JSON.parse(job.payload_json) as Parameters<typeof enqueueMessage>[0]);
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 function detectMediaType(mimeType: string): 'image' | 'video' | 'audio' | 'document' {
