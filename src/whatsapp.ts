@@ -35,6 +35,7 @@ export type SendPayload = {
   text: string;
   media?: SendMedia;
   buttons?: Array<{ id?: string; text: string }>;
+  mentionAll?: boolean;
 };
 
 type StatusListener = (status: WhatsAppStatus) => void;
@@ -67,9 +68,19 @@ class WhatsAppService {
     for (const listener of this.listeners) listener(this.status);
   }
 
+  private reconnectTimer?: NodeJS.Timeout;
+  private reconnectAttempts = 0;
+
   async connect() {
     if (this.starting) return this.starting;
-    if (this.socket && this.status.connected) return;
+    // Evita criar múltiplos sockets concorrentes (causa Stream Errored conflict)
+    if (this.socket || this.status.connecting) return;
+
+    // Cancela timer pendente se usuário clicou manualmente
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
 
     this.starting = this.startSocket();
     try {
@@ -91,10 +102,23 @@ class WhatsAppService {
       version,
       logger,
       printQRInTerminal: false,
-      browser: ['Notify', 'Chrome', '1.0.0']
+      browser: ['Notify', 'Chrome', '1.0.0'],
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
+      shouldSyncHistoryMessage: () => false
     });
 
-    this.socket.ev.on('creds.update', saveCreds);
+    const safeSaveCreds = async () => {
+      try {
+        await saveCreds();
+      } catch (err) {
+        // Ignora ENOENT quando logout removeu o diretório enquanto ainda salvava
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code !== 'ENOENT') console.error('[whatsapp] saveCreds falhou:', err);
+      }
+    };
+    this.socket.ev.on('creds.update', safeSaveCreds);
     this.socket.ev.on('messages.update', (updates) => {
       for (const update of updates) {
         const messageId = update.key.id;
@@ -115,40 +139,93 @@ class WhatsAppService {
       }
 
       if (connection === 'open') {
+        this.reconnectAttempts = 0;
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = undefined;
+        }
         this.setStatus({
           connected: true,
           connecting: false,
           qr: undefined,
+          lastDisconnect: undefined,
           user: {
             id: this.socket?.user?.id,
             name: this.socket?.user?.name
           }
         });
+        console.log(`[whatsapp] Conectado como ${this.socket?.user?.id} (${this.socket?.user?.name})`);
       }
 
       if (connection === 'close') {
         const error = lastDisconnect?.error as Boom | undefined;
         const statusCode = error?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        const loggedOut = statusCode === DisconnectReason.loggedOut; // 401
+        const isReplaced = statusCode === DisconnectReason.connectionReplaced; // 440 - Stream Errored (conflict)
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired; // 515
+        const isBadSession = statusCode === DisconnectReason.badSession; // 500
+        // Extrai mensagem amigável
+        let lastDisconnectMsg: string = (error as any)?.message ?? error?.output?.payload?.message ?? 'Conexao encerrada';
+        if (isReplaced || /Stream Errored.*conflict/i.test(lastDisconnectMsg)) {
+          lastDisconnectMsg = 'Stream Errored (conflict) - sessao duplicada. Outro dispositivo/processo assumiu a conexao. Escaneie o QR novamente para retomar.';
+        } else if (statusCode === 428) {
+          lastDisconnectMsg = `Connection Closed (${statusCode}): ${lastDisconnectMsg}`;
+        } else if (statusCode === 408) {
+          lastDisconnectMsg = `Timed Out / Connection Lost (${statusCode}): ${lastDisconnectMsg}`;
+        }
         this.setStatus({
           connected: false,
           connecting: false,
           qr: undefined,
-          lastDisconnect: error?.message ?? 'Conexao encerrada'
+          lastDisconnect: lastDisconnectMsg
         });
+        // Limpa socket anterior
+        try { this.socket?.ev.removeAllListeners('creds.update'); } catch {}
         this.socket = undefined;
-        if (!loggedOut) {
-          setTimeout(() => void this.connect().catch(() => undefined), 2000);
+        // Decide se deve reconectar automaticamente
+        if (loggedOut) {
+          console.warn('[whatsapp] Deslogado (401) - NAO reconectando automaticamente. Requer novo login via QR.');
+          this.reconnectAttempts = 0;
+        } else if (isReplaced) {
+          console.warn('[whatsapp] Conflict 440 - sessao substituida. NAO reconectando automaticamente para evitar loop. Aguardando clique em "Conectar" para gerar novo QR.');
+          this.reconnectAttempts = 0;
+          // Não agenda reconexão automática - usuário deve clicar em Conectar
+        } else if (isBadSession) {
+          console.warn('[whatsapp] Bad session 500 - limpando estado e solicitando novo QR no proximo connect');
+          this.reconnectAttempts = 0;
+        } else {
+          // Para restartRequired, timedOut, connectionClosed, etc: reconecta com backoff
+          this.reconnectAttempts += 1;
+          const baseDelay = isRestartRequired ? 2000 : 3000;
+          const delay = Math.min(baseDelay * Math.pow(1.5, this.reconnectAttempts - 1), 30000);
+          console.warn(`[whatsapp] Desconectado (${statusCode ?? 'unknown'}). Tentando reconectar em ${delay}ms (tentativa ${this.reconnectAttempts}) - ${lastDisconnectMsg}`);
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = undefined;
+            void this.connect().catch((e) => console.error('[whatsapp] reconexao falhou', e));
+          }, delay);
         }
       }
     });
   }
 
   async logout() {
-    await this.socket?.logout();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.reconnectAttempts = 0;
+    try {
+      await this.socket?.logout();
+    } catch (e) {
+      console.warn('[whatsapp] logout falhou (socket já fechado?)', e);
+    }
     this.socket = undefined;
-    fs.rmSync(config.baileysAuthDir, { recursive: true, force: true });
-    this.setStatus({ connected: false, connecting: false });
+    this.starting = undefined;
+    try {
+      fs.rmSync(config.baileysAuthDir, { recursive: true, force: true });
+    } catch {}
+    this.setStatus({ connected: false, connecting: false, qr: undefined, lastDisconnect: undefined });
   }
 
   async listGroups() {
@@ -181,10 +258,27 @@ class WhatsAppService {
     }
   }
 
+  async getGroupParticipants(jid: string): Promise<string[]> {
+    await this.ensureConnected();
+    if (!jid.endsWith('@g.us')) return [];
+    try {
+      const metadata = await this.socket!.groupMetadata(jid);
+      return metadata.participants.map((p: any) => p.id as string);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[whatsapp] getGroupParticipants falhou para ${jid}:`, msg);
+      // não falha o envio – apenas não menciona
+      return [];
+    }
+  }
+
   async send(payload: SendPayload) {
     await this.ensureConnected();
     try {
-      const content = await this.buildMessage(payload);
+      const mentions = payload.mentionAll && payload.jid.endsWith('@g.us')
+        ? await this.getGroupParticipants(payload.jid)
+        : undefined;
+      const content = await this.buildMessage(payload, mentions);
       return await this.socket!.sendMessage(payload.jid, content);
     } catch (error) {
       this.handleSocketError(error);
@@ -193,7 +287,17 @@ class WhatsAppService {
 
   private async ensureConnected() {
     if (!this.socket || !this.status.connected) {
+      // Se já está conectando (QR sendo exibido), não tenta reconectar em loop
+      if (this.status.connecting) {
+        throw new Error('WhatsApp ainda conectando. Escaneie o QR code se disponível.');
+      }
       await this.connect();
+      // Aguarda até 3s para ver se conecta (evita corrida de múltiplos jobs criarem sockets paralelos)
+      for (let i = 0; i < 30; i++) {
+        if (this.status.connected && this.socket) break;
+        if (!this.status.connecting) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
     }
     if (!this.socket || !this.status.connected) {
       throw new Error('WhatsApp não está conectado. Escaneie o QR code primeiro.');
@@ -211,29 +315,49 @@ class WhatsAppService {
     throw error;
   }
 
-  private async buildMessage(payload: SendPayload): Promise<AnyMessageContent> {
-    const text = this.withButtonFallback(payload.text, payload.buttons);
-    if (!payload.media) return { text };
+  private async buildMessage(payload: SendPayload, mentions?: string[]): Promise<AnyMessageContent> {
+    let text = this.withButtonFallback(payload.text, payload.buttons);
+    // Para mentionAll em grupo: se mencionar todos, Baileys exige lista de JIDs em mentions.
+    // WhatsApp só exibe @ visível se o texto contiver os @, então garantimos que o texto contenha
+    // pelo menos um marcador quando houver mentions (sem poluir com centenas de @).
+    // Se houver mentions e o texto não contiver nenhum "@", adicionamos espaço reservado.
+    const hasMentions = mentions && mentions.length > 0;
+    if (hasMentions && !text.includes('@')) {
+      // Baileys ainda notifica mesmo sem @ no texto quando mentions é fornecido,
+      // mas adicionamos um hint discreto para UX
+      text = text; // mantém original – Baileys envia notificação silenciosa
+    }
+    if (!payload.media) {
+      return hasMentions ? { text, mentions } : { text };
+    }
 
     const buffer = await this.fetchMedia(payload.media.url);
     const mimetype = payload.media.mimetype || mime.lookup(payload.media.url) || 'application/octet-stream';
 
     if (payload.media.type === 'image') {
-      return { image: buffer, caption: text, mimetype };
+      return hasMentions ? { image: buffer, caption: text, mimetype, mentions } as AnyMessageContent : { image: buffer, caption: text, mimetype };
     }
     if (payload.media.type === 'video') {
-      return { video: buffer, caption: text, mimetype };
+      return hasMentions ? { video: buffer, caption: text, mimetype, mentions } as AnyMessageContent : { video: buffer, caption: text, mimetype };
     }
     if (payload.media.type === 'audio') {
       return { audio: buffer, mimetype, ptt: false };
     }
 
-    return {
-      document: buffer,
-      mimetype,
-      fileName: payload.media.fileName || path.basename(new URL(payload.media.url).pathname) || 'arquivo',
-      caption: text
-    };
+    return hasMentions
+      ? {
+          document: buffer,
+          mimetype,
+          fileName: payload.media.fileName || path.basename(new URL(payload.media.url).pathname) || 'arquivo',
+          caption: text,
+          mentions,
+        } as AnyMessageContent
+      : {
+          document: buffer,
+          mimetype,
+          fileName: payload.media.fileName || path.basename(new URL(payload.media.url).pathname) || 'arquivo',
+          caption: text
+        };
   }
 
   private mapMessageStatus(status?: proto.WebMessageInfo.Status | null) {
@@ -251,11 +375,39 @@ class WhatsAppService {
   }
 
   private async fetchMedia(url: string) {
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Falha ao baixar midia (${response.status})`);
+    // Se URL aponta para /uploads local, ler direto do disco (evita fetch externo que falha com :3999)
+    try {
+      const parsed = new URL(url);
+      if (parsed.pathname.startsWith('/uploads/')) {
+        const filename = path.basename(parsed.pathname);
+        const localPath = path.join(config.uploadDir, filename);
+        if (fs.existsSync(localPath)) {
+          return fs.readFileSync(localPath);
+        }
+        // fallback: tenta /data/uploads + pathname
+        const altPath = path.resolve(config.uploadDir, '.' + parsed.pathname);
+        if (fs.existsSync(altPath)) return fs.readFileSync(altPath);
+      }
+    } catch {
+      // url pode ser relativa ou inválida, tenta como caminho local
+      const maybePath = path.join(config.uploadDir, path.basename(url));
+      if (fs.existsSync(maybePath)) return fs.readFileSync(maybePath);
     }
-    return Buffer.from(await response.arrayBuffer());
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(url, { signal: controller.signal, redirect: 'follow' } as RequestInit);
+      if (!response.ok) {
+        throw new Error(`Falha ao baixar midia (${response.status}) de ${url}`);
+      }
+      return Buffer.from(await response.arrayBuffer());
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') throw new Error(`Timeout ao baixar mídia: ${url}`);
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
 

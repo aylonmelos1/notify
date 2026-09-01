@@ -138,9 +138,17 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     }
   }
 
+  // TTL 5s para notice flutuante
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(''), 5000);
+    return () => window.clearTimeout(t);
+  }, [notice]);
+
   const meta = sectionMeta[section];
 
   return (
+    <>
     <main className="app-shell">
       <aside className="sidebar">
         <div className="sidebar-brand">
@@ -182,12 +190,6 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
           </span>
         </header>
 
-        {notice && (
-          notice.startsWith('erro:')
-            ? <div className="error">{notice.slice(5)}</div>
-            : <div className="notice">{notice}</div>
-        )}
-
         {section === 'conexao'   && <ConnectionCard status={status} api={api} run={run} />}
         {section === 'destinos'  && <DestinationCard destinations={destinations} api={api} run={run} />}
         {section === 'templates' && <TemplateCard templates={templates} api={api} run={run} />}
@@ -201,6 +203,21 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         {section === 'api'       && <ApiSection apiInfo={apiInfo} />}
       </div>
     </main>
+    {notice && (
+      <div className="toast-stack" aria-live="polite">
+        <div
+          className={notice.startsWith('erro:') ? 'toast toast--error' : 'toast toast--ok'}
+          onClick={() => setNotice('')}
+          role="status"
+          title="Clique para fechar"
+        >
+          <span className="toast-dot" />
+          <span>{notice.startsWith('erro:') ? notice.slice(5) : notice}</span>
+          <button className="toast-close" aria-label="Fechar">×</button>
+        </div>
+      </div>
+    )}
+    </>
   );
 }
 
@@ -228,22 +245,62 @@ function ConnectionCard({ status, api, run }: {
 
 /* ── Destinations ───────────────────────────────── */
 
+type AvailableGroup = { jid: string; name: string; participants: number };
+
 function DestinationCard({ destinations, api, run }: {
   destinations: Destination[]; api: Api; run: Run;
 }) {
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [toggling, setToggling] = useState<number | null>(null);
+  const [available, setAvailable] = useState<AvailableGroup[]>([]);
+  const [loadingAvail, setLoadingAvail] = useState(false);
+  const [addingJid, setAddingJid] = useState<string | null>(null);
+
+  async function toggleEnabled(d: Destination) {
+    setToggling(d.id);
+    try {
+      await api.patch(`/api/admin/destinations/${d.id}/enabled`, { enabled: !d.enabled });
+      await run(() => Promise.resolve(), d.enabled ? 'Destino desativado' : 'Destino ativado');
+    } catch (e) {
+      setToggling(null);
+      throw e;
+    }
+    setToggling(null);
+  }
+
+  async function fetchAvailable() {
+    setLoadingAvail(true);
+    try {
+      const groups: AvailableGroup[] = await api.get('/api/admin/groups/available');
+      setAvailable(groups);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`Falha ao buscar grupos: ${msg}`);
+    } finally {
+      setLoadingAvail(false);
+    }
+  }
+
+  async function handleAddGroup(g: AvailableGroup) {
+    setAddingJid(g.jid);
+    try {
+      await run(() => api.post('/api/admin/destinations', { name: g.name, type: 'group', jid: g.jid }), `Grupo "${g.name}" adicionado`);
+    } finally {
+      setAddingJid(null);
+    }
+  }
+
+  const addedJids = new Set(destinations.filter(d => d.type === 'group').map(d => d.jid));
 
   return (
+    <div style={{ display: 'grid', gap: 14 }}>
     <section className="panel" id="destinos">
       <div className="section-title">
         <div>
           <h3>Números e grupos</h3>
-          <p>Cadastre destinos manuais ou importe grupos da conta.</p>
+          <p>Cadastre números manualmente. Grupos são adicionados da lista abaixo.</p>
         </div>
-        <button onClick={() => run(() => api.post('/api/admin/groups/sync', {}), 'Grupos sincronizados')}>
-          Sincronizar grupos
-        </button>
       </div>
       <form className="inline-form" onSubmit={(e) => {
         e.preventDefault();
@@ -254,26 +311,106 @@ function DestinationCard({ destinations, api, run }: {
         <input placeholder="WhatsApp com DDI" value={phone} onChange={(e) => setPhone(e.target.value)} />
         <button className="primary">Adicionar</button>
       </form>
-      <DataTable
-        columns={['Nome', 'Tipo', 'JID / Telefone', 'Status', '']}
-        rows={destinations.map((d) => [
-          d.name,
-          d.type === 'group' ? 'Grupo' : 'Número',
-          d.phone || d.jid,
-          d.enabled ? 'Ativo' : 'Inativo',
-        ])}
-        actions={destinations.map((d) => (
-          <button
-            key={d.id}
-            className="danger"
-            style={{ padding: '4px 10px', fontSize: '12px' }}
-            onClick={() => run(() => api.delete(`/api/admin/destinations/${d.id}`), 'Destino removido')}
-          >
-            Excluir
-          </button>
-        ))}
-      />
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Nome</th>
+              <th>Tipo</th>
+              <th>JID / Telefone</th>
+              <th style={{ textAlign: 'center' }}>Ativo</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {destinations.length === 0 && (
+              <tr><td colSpan={5} style={{ color: 'var(--muted)', textAlign: 'center' }}>Nenhum registro.</td></tr>
+            )}
+            {destinations.map((d) => (
+              <tr key={d.id} style={{ opacity: d.enabled ? 1 : 0.55 }}>
+                <td title={d.name}>{d.name}</td>
+                <td>{d.type === 'group' ? 'Grupo' : 'Número'}</td>
+                <td title={d.phone || d.jid} style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.phone || d.jid}</td>
+                <td style={{ textAlign: 'center' }}>
+                  <label className="toggle" title={d.enabled ? 'Desativar' : 'Ativar'}>
+                    <input
+                      type="checkbox"
+                      checked={!!d.enabled}
+                      disabled={toggling === d.id}
+                      onChange={() => void toggleEnabled(d).catch((err) => {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        alert(msg);
+                      })}
+                    />
+                    <span className="toggle-slider" />
+                  </label>
+                </td>
+                <td>
+                  <button
+                    className="danger"
+                    style={{ padding: '4px 10px', fontSize: '12px' }}
+                    onClick={() => run(() => api.delete(`/api/admin/destinations/${d.id}`), 'Destino removido')}
+                  >
+                    Excluir
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="api-hint" style={{ marginTop: 4 }}>Dica: destinos desativados permanecem salvos mas não recebem mensagens (fila retorna <code>Destino não encontrado ou desativado</code>).</p>
     </section>
+
+    <section className="panel" id="grupos-disponiveis">
+      <div className="section-title">
+        <div>
+          <h3>Grupos disponíveis no WhatsApp</h3>
+          <p>Clique em Adicionar para incluir o grupo nos destinos. Não adiciona automaticamente.</p>
+        </div>
+        <button onClick={fetchAvailable} disabled={loadingAvail}>
+          {loadingAvail ? 'Buscando...' : 'Buscar grupos'}
+        </button>
+      </div>
+      {available.length === 0 ? (
+        <p className="api-hint">
+          {loadingAvail ? 'Carregando...' : 'Nenhum grupo carregado. Clique em "Buscar grupos" para listar os grupos da conta conectada.'}
+        </p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Nome</th><th>Participantes</th><th>JID</th><th></th></tr></thead>
+            <tbody>
+              {available.map((g) => {
+                const already = addedJids.has(g.jid);
+                return (
+                  <tr key={g.jid} style={{ opacity: already ? 0.55 : 1 }}>
+                    <td title={g.name}>{g.name}</td>
+                    <td>{g.participants}</td>
+                    <td title={g.jid} style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>{g.jid}</td>
+                    <td>
+                      {already ? (
+                        <span style={{ fontSize: 12, color: 'var(--muted)' }}>Já adicionado</span>
+                      ) : (
+                        <button
+                          className="primary"
+                          style={{ padding: '4px 10px', fontSize: '12px' }}
+                          disabled={addingJid === g.jid}
+                          onClick={() => void handleAddGroup(g)}
+                        >
+                          {addingJid === g.jid ? 'Adicionando...' : 'Adicionar'}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+    </div>
   );
 }
 
@@ -369,6 +506,7 @@ function SendCard({ destinations, templates, api, run }: {
   const [mediaUrl, setMediaUrl]           = useState('');
   const [uploadMode, setUploadMode]       = useState(false);
   const [uploading, setUploading]         = useState(false);
+  const [mentionAll, setMentionAll]       = useState(false);
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -397,12 +535,14 @@ function SendCard({ destinations, templates, api, run }: {
       </div>
       <form className="send-grid" onSubmit={(e) => {
         e.preventDefault();
+        const sel = destinations.find(d => String(d.id) === destinationId);
         const payload: Record<string, unknown> = {
           destinationId: Number(destinationId),
           variables: variables.trim() ? JSON.parse(variables) : undefined,
           message: message.trim() || undefined,
           templateId: templateId ? Number(templateId) : undefined,
           media: mediaUrl && mediaType ? { type: mediaType, url: mediaUrl } : undefined,
+          mentionAll: mentionAll && sel?.type === 'group' ? true : undefined,
         };
         void run(() => api.post('/api/admin/send', payload), 'Mensagem enfileirada');
       }}>
@@ -449,6 +589,25 @@ function SendCard({ destinations, templates, api, run }: {
             )}
           </div>
         )}
+
+        {(() => {
+          const sel = destinations.find(d => String(d.id) === destinationId);
+          const isGroup = sel?.type === 'group';
+          return (
+            <label className="mention-row" style={{ display: 'flex', alignItems: 'center', gap: 8, gridColumn: '1 / -1', opacity: isGroup ? 1 : 0.5 }}>
+              <input
+                type="checkbox"
+                checked={mentionAll}
+                disabled={!isGroup}
+                onChange={(e) => setMentionAll(e.target.checked)}
+                style={{ width: 16, height: 16 }}
+              />
+              <span style={{ fontSize: 13, color: 'var(--muted-strong)' }}>
+                Mencionar todos do grupo (@everyone){!isGroup && destinationId ? ' — selecione um grupo' : ''}
+              </span>
+            </label>
+          );
+        })()}
 
         <button className="primary">Enviar mensagem</button>
       </form>
@@ -594,7 +753,13 @@ function ApiSection({ apiInfo }: { apiInfo: ApiInfo | null }) {
   -d '{
     "destinationId": 1,
     "message": "Olá! Mensagem via Notify."
-  }'`;
+  }'
+
+# Mencionar todos em grupo:
+# curl -X POST ${baseUrl}/api/send \\
+#   -H "X-Notify-Token: ${displayToken}" \\
+#   -H "Content-Type: application/json" \\
+#   -d '{"destinationId": 12, "message": "Atenção equipe!", "mentionAll": true}'`;
 
   const jsCode = `const res = await fetch('${baseUrl}/api/send', {
   method: 'POST',
@@ -608,7 +773,14 @@ function ApiSection({ apiInfo }: { apiInfo: ApiInfo | null }) {
   }),
 });
 const data = await res.json();
-console.log(data); // { jobId, status, queuedAt }`;
+console.log(data); // { id, status }
+
+// Grupo com @everyone
+// await fetch('${baseUrl}/api/send', {
+//   method: 'POST',
+//   headers: { 'X-Notify-Token': '${displayToken}', 'Content-Type': 'application/json' },
+//   body: JSON.stringify({ destinationId: 12, message: 'Atenção!', mentionAll: true })
+// });`;
 
   const pythonCode = `import requests
 
@@ -623,7 +795,12 @@ res = requests.post(
         'message': 'Olá! Mensagem via Notify.',
     },
 )
-print(res.json())  # {'jobId': ..., 'status': 'queued', ...}`;
+print(res.json())  # {'id': ..., 'status': 'pending', ...}
+
+# Mencionar todos no grupo
+# requests.post('${baseUrl}/api/send',
+#   headers={'X-Notify-Token': '${displayToken}'},
+#   json={'destinationId': 12, 'message': 'Atenção equipe!', 'mentionAll': True})`;
 
   const activeCode = { curl: curlCode, js: jsCode, python: pythonCode }[activeTab];
 
@@ -646,7 +823,7 @@ print(res.json())  # {'jobId': ..., 'status': 'queued', ...}`;
 
   const schemaFields = [
     { field: 'destinationId', type: 'number',     req: 'condicional', desc: 'ID de um destino cadastrado no painel' },
-    { field: 'jid',           type: 'string',     req: 'condicional', desc: 'JID direto (ex: 5511999888777@s.whatsapp.net)' },
+    { field: 'jid',           type: 'string',     req: 'condicional', desc: 'JID direto (ex: 5511999888777@s.whatsapp.net ou 120363...@g.us)' },
     { field: 'phone',         type: 'string',     req: 'condicional', desc: 'Número com DDI sem formatação (ex: 5511999888777)' },
     { field: 'message',       type: 'string',     req: 'condicional', desc: 'Texto livre da mensagem' },
     { field: 'templateId',    type: 'number',     req: 'condicional', desc: 'ID de um template salvo no painel' },
@@ -655,6 +832,7 @@ print(res.json())  # {'jobId': ..., 'status': 'queued', ...}`;
     { field: 'media.url',     type: 'URL',        req: 'opcional',    desc: 'URL pública acessível pelo servidor' },
     { field: 'media.fileName',type: 'string',     req: 'opcional',    desc: 'Nome do arquivo (recomendado para documentos)' },
     { field: 'buttons',       type: 'array',      req: 'opcional',    desc: '[{text:"Sim"}, {text:"Não"}] — máximo 5' },
+    { field: 'mentionAll',    type: 'boolean',    req: 'opcional',    desc: 'Se true e destino é grupo, menciona todos (@everyone)' },
   ];
 
   return (
@@ -789,14 +967,20 @@ type Api = ReturnType<typeof createApi>;
 
 function createApi(token: string, onUnauthorized: () => void) {
   async function request(method: string, url: string, body?: unknown) {
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+    const hasBody = body !== undefined;
+    if (hasBody) headers['Content-Type'] = 'application/json';
     const res = await fetch(url, {
       method,
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      headers,
+      body: hasBody ? JSON.stringify(body) : undefined,
     });
     if (res.status === 401) onUnauthorized();
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? 'Erro na requisição');
+    // Alguns endpoints 204 não retornam json
+    const text = await res.text();
+    let data: any = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    if (!res.ok) throw new Error(data.error ?? data.message ?? `Erro ${res.status}`);
     return data;
   }
 
@@ -816,6 +1000,7 @@ function createApi(token: string, onUnauthorized: () => void) {
     get:    (url: string)                     => request('GET', url),
     post:   (url: string, body: unknown)      => request('POST', url, body),
     put:    (url: string, body: unknown)      => request('PUT', url, body),
+    patch:  (url: string, body: unknown)      => request('PATCH', url, body),
     delete: (url: string)                     => request('DELETE', url),
     upload: (url: string, fd: FormData)       => upload(url, fd),
   };

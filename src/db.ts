@@ -50,6 +50,8 @@ create table if not exists message_jobs (
 );
 
 create index if not exists idx_message_jobs_created_at on message_jobs(created_at desc);
+create index if not exists idx_message_jobs_status on message_jobs(status);
+create index if not exists idx_message_jobs_baileys on message_jobs(baileys_message_id);
 create index if not exists idx_destinations_type on destinations(type);
 `);
 

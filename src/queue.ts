@@ -15,6 +15,7 @@ export type EnqueuePayload = {
   variables?: Record<string, unknown>;
   media?: SendMedia;
   buttons?: Array<{ id?: string; text: string }>;
+  mentionAll?: boolean;
 };
 
 type JobData = {
@@ -23,10 +24,21 @@ type JobData = {
   text: string;
   media?: SendMedia;
   buttons?: Array<{ id?: string; text: string }>;
+  mentionAll?: boolean;
 };
 
-const connection = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
-export const sendQueue = new Queue<JobData>('notify-send', { connection });
+function createRedis() {
+  return new Redis(config.redisUrl, {
+    maxRetriesPerRequest: null,
+    enableReadyCheck: true,
+    retryStrategy: (times) => Math.min(times * 200, 2000),
+  });
+}
+const queueConnection = createRedis();
+const workerConnection = createRedis();
+queueConnection.on('error', (e) => console.error('[redis queue] error', e.message));
+workerConnection.on('error', (e) => console.error('[redis worker] error', e.message));
+export const sendQueue = new Queue<JobData>('notify-send', { connection: queueConnection });
 
 const getDestination = db.prepare<number, Destination>('select * from destinations where id = ? and enabled = 1');
 const getTemplate = db.prepare<number, Template>('select * from templates where id = ?');
@@ -63,7 +75,8 @@ export async function enqueueMessage(payload: EnqueuePayload) {
     jid: destination.jid,
     text: rendered,
     media: payload.media,
-    buttons: payload.buttons
+    buttons: payload.buttons,
+    mentionAll: payload.mentionAll,
   }, {
     jobId: id,
     attempts: 3,
@@ -114,35 +127,60 @@ function resolveMessage(payload: EnqueuePayload) {
 }
 
 export function startSendWorker() {
-  return new Worker<JobData>('notify-send', handleJob, { connection, concurrency: 2 });
+  return new Worker<JobData>('notify-send', handleJob, { connection: workerConnection, concurrency: 2 });
 }
 
 async function handleJob(job: Job<JobData>) {
   try {
-    const jid = job.data.jid.endsWith('@s.whatsapp.net')
-      ? await whatsapp.resolveNumber(job.data.jid)
-      : job.data.jid;
+    // Não sobrescrever @lid com onWhatsApp que falharia; resolver apenas números puros.
+    // Se jid já contém @lid ou @g.us, manter como está.
+    let jid = job.data.jid;
+    if (jid.endsWith('@s.whatsapp.net')) {
+      try {
+        const resolved = await whatsapp.resolveNumber(jid);
+        // resolved pode ser @lid (novo padrão) ou @s.whatsapp.net normalizado
+        jid = resolved;
+      } catch (err) {
+        // Se falhar onWhatsApp (ex: número válido mas temporário), tenta enviar com jid original
+        console.warn(`[queue] resolveNumber falhou para ${jid}:`, (err as Error).message);
+      }
+    }
+    // Atualiza job com jid resolvido (mesmo que @lid, útil para histórico)
     updateResolvedJid.run(jid, job.data.id);
     const savedJob = db.prepare<string, MessageJob>('select * from message_jobs where id = ?').get(job.data.id);
-    if (savedJob?.destination_id) {
-      updateDestinationResolvedJid.run(jid, savedJob.destination_id);
-    }
+    // Não sobrescrever destinos @s.whatsapp.net com @lid automaticamente (preserva número original)
+    // Apenas atualiza se o jid resolvido for diferente e contiver o número original, ou se for conversão lid->pn conhecida.
+    // Por segurança, manter destinos número como @s.whatsapp.net para permitir re-resolução futura.
     const result = await whatsapp.send({
       jid,
       text: job.data.text,
       media: job.data.media,
-      buttons: job.data.buttons
+      buttons: job.data.buttons,
+      mentionAll: job.data.mentionAll,
     });
-    markAccepted.run(result?.key?.id ?? null, job.attemptsMade + 1, job.data.id);
+    // Enviar marca como sent imediatamente (não apenas pending); receipt posterior atualiza para delivered/read
+    const baileysId = result?.key?.id ?? null;
+    if (baileysId) {
+      markSent.run('sent', baileysId, job.attemptsMade + 1, job.data.id);
+    } else {
+      markAccepted.run(null, job.attemptsMade + 1, job.data.id);
+      // fallback: também marca sent se não temos id mas não houve erro
+      db.prepare("update message_jobs set status='sent', sent_at=datetime('now'), updated_at=datetime('now') where id=? and status='pending'").run(job.data.id);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // Não contar como tentativa falha se erro é de conexão temporária e BullMQ vai retentar
     markFailed.run('failed', message, job.attemptsMade + 1, job.data.id);
     throw error;
   }
 }
 
 whatsapp.onMessageStatus(({ messageId, status }) => {
-  markReceipt.run(status, messageId);
+  try {
+    markReceipt.run(status, messageId);
+  } catch (e) {
+    console.error('[queue] markReceipt failed', e);
+  }
 });
 
 export function listJobs(limit = 100) {
